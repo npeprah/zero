@@ -7,49 +7,36 @@ Simulates actual trade execution using real historical SPX price data.
 Data sources (all via yfinance, no API key needed):
     ^GSPC hourly  — ~3 years of intraday bars for entry/exit simulation
     ^GSPC daily   — 5 years for long-period EMA calculations (EMA 120/233)
-    ^VIX daily    — volatility filter + premium estimation
+    ^VIX  daily   — volatility filter + premium estimation
 
 Methodology (no lookahead bias):
     For each trading day D:
-    1. Compute EMA clouds + ADX/RSI using data UP TO end of D-1
-       (simulates checking pre-market before the open)
-    2. Apply VIX gate: skip if VIX > 25 (proxy for negative GEX / panic days)
-    3. At 11:00 AM ET: read entry price from hourly bar
-    4. Select strikes based on ATR-derived expected move
-    5. Monitor 11am–3:30pm intraday bars for stop-loss events
-    6. At 3:30 PM ET: settle position, calculate P&L
+    1. Compute EMA clouds + ADX/RSI using ONLY data before D
+    2. Apply regime + VIX gates
+    3. Enter at 11:00 AM ET hourly bar
+    4. Monitor intraday hourly bars for stop-loss / profit-take
+    5. Settle remaining position at 3:30 PM ET
 
-P&L Model:
-    Iron Condor (credit spread):
-        Win  = SPX stays between short strikes at 3:30pm
-        Loss = short strike breached → capped at (spread_width − credit)
-    Bull Call / Bear Put Spread (debit):
-        Win  = spread expires ITM → profit = intrinsic value − debit
-        Loss = spread expires OTM → lose full debit
+Key lessons from v1 tuning:
+    - Condor strikes at 24 pts from ATM got touched 71% of days → too tight
+    - Fixed 0.3% directional stop = 18 pts on ATR-65 days → pure noise
+    - When condors reach expiry they avg +$222 → strikes are fine, stop was broken
+    - Fix: hourly-CLOSE-based stop + ATR-scaled stops + wider condor strikes
 
-Premium Estimation (no option chain data available):
-    Credit ≈ min(0.30 × width × VIX/15, 0.50 × width)
-    Debit  ≈ 0.40 × spread_width
-
-Note: GEX historical data not available — VIX > 25 used as proxy filter.
-      Real strategy with GEX filter may perform 5-10% better on win rate.
+Four configs are run and compared to find the best parameter set.
 """
 
 import sys
-import logging
 import warnings
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
-from collections import defaultdict
 from enum import Enum
 
 warnings.filterwarnings("ignore")
-logging.basicConfig(level=logging.WARNING)  # Quiet yfinance noise
-logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -64,775 +51,663 @@ class BotType(Enum):
 
 
 class ExitReason(Enum):
-    EXPIRY      = "EXPIRY"        # Normal 3:30pm settle
-    STOP_LOSS   = "STOP_LOSS"     # Stopped out intraday
-    NO_ENTRY    = "NO_ENTRY"      # Missing data
+    EXPIRY       = "EXPIRY"
+    STOP_LOSS    = "STOP_LOSS"
+    PROFIT_TAKE  = "PROFIT_TAKE"
+    NO_ENTRY     = "NO_ENTRY"
+
+
+@dataclass
+class BacktestConfig:
+    """
+    All tunable parameters in one place.
+    Run multiple configs to find the best combination.
+    """
+    name: str = "default"
+
+    # ── Iron Condor (SIDEWAYS) ────────────────────────────────────────
+    # Strike distance = condor_atr_mult × (ATR / 2) from ATM
+    # v1 was 0.65 (~24 pts on ATR-65) → 71% stop rate; fix: go wider
+    condor_atr_mult:    float = 0.65
+
+    # v1: stop on any intraday HIGH/LOW touch → noisy
+    # Better: stop only when hourly bar CLOSES beyond short strike
+    condor_stop_on_close: bool = False
+
+    # Close condor early at 2:30pm if both strikes are untouched
+    # Simulates real-world "take 60-70% of credit" rule
+    condor_early_exit:  bool  = False
+    condor_early_exit_pct: float = 0.65  # keep this % of credit
+
+    # ADX must be below this to trade the condor (low-trend required)
+    adx_sideways_max:   float = 25.0
+    vix_max_condor:     float = 22.0     # condors need calm vol
+
+    # ── Directional (BULLISH / BEARISH) ──────────────────────────────
+    # v1: stop at fixed 0.3% (18 pts on ATR-65 days) → too tight
+    # Better: ATR-based stop (adaptive to current vol)
+    dir_stop_atr_mult:  float = 0.20     # stop at 0.20 × ATR from entry
+    dir_spread_width:   float = 10.0     # $10 wide spreads
+
+    # Min ADX for directional trade (want a real trend)
+    adx_directional_min: float = 25.0
+    rsi_bull_min:       float = 55.0     # min RSI for bullish
+    rsi_bear_max:       float = 45.0     # max RSI for bearish
+    vix_max_dir:        float = 28.0
+
+    # ── Global ────────────────────────────────────────────────────────
+    confluence_min:     int   = 3        # min EMA confluence (0-5)
+    di_gap_min:         float = 3.0      # min |DI+ - DI-| for directional
 
 
 @dataclass
 class TradeRecord:
-    date:           date
-    bot_type:       BotType
-    entry_price:    float
-    exit_price:     float
-
-    # Strikes
-    strike_a:       float   # Call sell / put buy / call sell (IC)
-    strike_b:       float   # Call buy  / put sell / put sell (IC)
-    strike_c:       float = 0   # IC put sell
-    strike_d:       float = 0   # IC put buy
-
-    # P&L
-    credit_or_debit: float = 0   # + = credit, - = debit
-    pnl:            float  = 0
-    exit_reason:    ExitReason = ExitReason.EXPIRY
-
-    # Context
-    vix:            float = 0
-    atr:            float = 0
-    regime:         str   = ""
-    confluence:     int   = 0
-    adx:            float = 0
-    rsi:            float = 0
+    date:            date
+    bot_type:        BotType
+    entry_price:     float
+    exit_price:      float
+    pnl:             float
+    exit_reason:     ExitReason
+    credit_or_debit: float
+    strike_a:        float
+    strike_b:        float
+    strike_c:        float = 0
+    strike_d:        float = 0
+    vix:             float = 0
+    atr:             float = 0
+    adx:             float = 0
+    rsi:             float = 0
+    confluence:      int   = 0
 
 
 # ============================================================================
-# DATA LOADER
+# DATA LOADER (fetches once, reused across all config runs)
 # ============================================================================
 
 class DataLoader:
-    """
-    Downloads and caches all historical data needed for the backtest.
-    Called once at startup.
-    """
-
     def __init__(self):
-        self.hourly_df: Optional[pd.DataFrame] = None
-        self.daily_df:  Optional[pd.DataFrame] = None
-        self.vix_df:    Optional[pd.DataFrame] = None
+        self.hourly_df = None
+        self.daily_df  = None
+        self.vix_df    = None
 
-    def load(self, verbose: bool = True) -> bool:
-        if verbose:
-            print("Fetching historical data from Yahoo Finance...")
-
+    def load(self) -> bool:
+        print("Fetching historical data from Yahoo Finance...")
         try:
-            # Hourly SPX — used for intraday entry/exit + short-period EMAs
             h = yf.Ticker("^GSPC").history(interval="1h", period="730d", auto_adjust=True)
-            if h.empty:
-                print("ERROR: Could not fetch hourly SPX data")
-                return False
-            h.index = pd.to_datetime(h.index, utc=True).tz_convert("America/New_York")
+            d = yf.Ticker("^GSPC").history(interval="1d", period="5y",   auto_adjust=True)
+            v = yf.Ticker("^VIX").history( interval="1d", period="5y",   auto_adjust=True)
+
+            for df in (h, d, v):
+                df.index = pd.to_datetime(df.index, utc=True).tz_convert("America/New_York")
+
             self.hourly_df = h
+            self.daily_df  = d
+            self.vix_df    = v
 
-            # Daily SPX — used for long-period EMAs (120, 233) + ATR
-            d = yf.Ticker("^GSPC").history(interval="1d", period="5y", auto_adjust=True)
-            d.index = pd.to_datetime(d.index, utc=True).tz_convert("America/New_York")
-            self.daily_df = d
-
-            # Daily VIX — volatility filter + premium estimation
-            v = yf.Ticker("^VIX").history(interval="1d", period="5y", auto_adjust=True)
-            v.index = pd.to_datetime(v.index, utc=True).tz_convert("America/New_York")
-            self.vix_df = v
-
-            if verbose:
-                print(f"  Hourly bars : {len(h):,} ({h.index[0].date()} → {h.index[-1].date()})")
-                print(f"  Daily bars  : {len(d):,} ({d.index[0].date()} → {d.index[-1].date()})")
-                print(f"  VIX bars    : {len(v):,} ({v.index[0].date()} → {v.index[-1].date()})")
+            print(f"  Hourly : {len(h):,}  ({h.index[0].date()} → {h.index[-1].date()})")
+            print(f"  Daily  : {len(d):,}  ({d.index[0].date()} → {d.index[-1].date()})")
             return True
-
         except Exception as e:
-            print(f"ERROR fetching data: {e}")
+            print(f"ERROR: {e}")
             return False
 
-    def get_trading_days(self) -> List[date]:
-        """Return all dates that have at least 5 intraday hourly bars"""
-        if self.hourly_df is None:
-            return []
-        day_counts = self.hourly_df.groupby(self.hourly_df.index.date).size()
-        return sorted([d for d, cnt in day_counts.items() if cnt >= 5])
+    def trading_days(self) -> List[date]:
+        cnt = self.hourly_df.groupby(self.hourly_df.index.date).size()
+        return sorted([d for d, c in cnt.items() if c >= 5])
 
 
 # ============================================================================
-# POINT-IN-TIME INDICATOR COMPUTER
+# POINT-IN-TIME INDICATOR ENGINE
 # ============================================================================
 
 class PointInTime:
-    """
-    Computes all indicators for a given date using ONLY data available
-    before market open on that date. Zero lookahead bias.
-    """
+    """Zero-lookahead indicator calculation as of pre-market on trading_day."""
 
     @staticmethod
-    def _ema_val(series: pd.Series, period: int) -> float:
-        if len(series) < period:
-            return float(series.iloc[-1]) if len(series) > 0 else 0.0
-        return float(series.ewm(span=period, adjust=False).mean().iloc[-1])
+    def _ema(s: pd.Series, p: int) -> float:
+        return float(s.ewm(span=p, adjust=False).mean().iloc[-1]) if len(s) >= 2 else float(s.iloc[-1])
 
     @staticmethod
-    def _ema_series(series: pd.Series, period: int) -> pd.Series:
-        return series.ewm(span=period, adjust=False).mean()
+    def _ema_s(s: pd.Series, p: int) -> pd.Series:
+        return s.ewm(span=p, adjust=False).mean()
 
     @staticmethod
-    def _atr(df: pd.DataFrame, period: int = 14) -> float:
+    def _atr(df: pd.DataFrame, p: int = 14) -> float:
         pc = df["Close"].shift(1)
-        tr = pd.concat([
-            df["High"] - df["Low"],
-            (df["High"] - pc).abs(),
-            (df["Low"]  - pc).abs(),
-        ], axis=1).max(axis=1)
-        return float(tr.ewm(span=period, adjust=False).mean().iloc[-1])
+        tr = pd.concat([df["High"]-df["Low"],
+                        (df["High"]-pc).abs(),
+                        (df["Low"]-pc).abs()], axis=1).max(axis=1)
+        return float(tr.ewm(span=p, adjust=False).mean().iloc[-1])
 
     @staticmethod
-    def _adx_rsi(series: pd.Series, high: pd.Series, low: pd.Series,
-                 period: int = 14) -> Tuple[float, float, float, float]:
-        """Returns (adx, plus_di, minus_di, rsi)"""
+    def _adx_rsi(close: pd.Series, high: pd.Series, low: pd.Series,
+                 p: int = 14) -> Tuple[float, float, float, float]:
         # RSI
-        delta = series.diff()
-        gain  = delta.where(delta > 0, 0.0)
-        loss  = (-delta).where(delta < 0, 0.0)
-        avg_g = gain.ewm(alpha=1/period, adjust=False).mean()
-        avg_l = loss.ewm(alpha=1/period, adjust=False).mean()
+        d     = close.diff()
+        g     = d.where(d > 0, 0.0)
+        l     = (-d).where(d < 0, 0.0)
         with np.errstate(invalid="ignore", divide="ignore"):
-            rs  = avg_g / avg_l.replace(0, np.nan)
-        rsi = float((100 - 100 / (1 + rs)).iloc[-1])
+            rsi = float((100 - 100/(1 + g.ewm(alpha=1/p, adjust=False).mean()
+                                     / l.ewm(alpha=1/p, adjust=False).mean()
+                                     .replace(0, np.nan))).iloc[-1])
 
         # ADX
-        n = len(series)
-        if n < period * 3:
+        n = len(close)
+        if n < p*3:
             return 20.0, 20.0, 20.0, rsi
 
-        h_arr = high.values.astype(float)
-        l_arr = low.values.astype(float)
-        c_arr = series.values.astype(float)
-
-        tr      = np.zeros(n)
-        plus_dm = np.zeros(n)
-        minus_dm= np.zeros(n)
+        h_a = high.values.astype(float)
+        l_a = low.values.astype(float)
+        c_a = close.values.astype(float)
+        # MUST create three separate arrays — shared assignment is a bug
+        tr  = np.zeros(n)
+        pdm = np.zeros(n)
+        mdm = np.zeros(n)
         for i in range(1, n):
-            tr[i]       = max(h_arr[i]-l_arr[i], abs(h_arr[i]-c_arr[i-1]), abs(l_arr[i]-c_arr[i-1]))
-            up          = h_arr[i] - h_arr[i-1]
-            down        = l_arr[i-1] - l_arr[i]
-            plus_dm[i]  = up   if (up   > down and up   > 0) else 0.0
-            minus_dm[i] = down if (down > up   and down > 0) else 0.0
+            tr[i]  = max(h_a[i]-l_a[i], abs(h_a[i]-c_a[i-1]), abs(l_a[i]-c_a[i-1]))
+            up, dn = h_a[i]-h_a[i-1], l_a[i-1]-l_a[i]
+            pdm[i] = up if (up > dn and up > 0) else 0.0
+            mdm[i] = dn if (dn > up and dn > 0) else 0.0
 
-        def ws(arr, p):
-            out = np.zeros(n)
+        def ws(a):
+            o = np.zeros(n)
             if p < n:
-                out[p] = arr[1:p+1].sum()
-                for i in range(p+1, n):
-                    out[i] = out[i-1] - out[i-1]/p + arr[i]
-            return out
+                o[p] = a[1:p+1].sum()
+                for i in range(p+1, n): o[i] = o[i-1] - o[i-1]/p + a[i]
+            return o
 
-        tr_s = ws(tr, period); pdm_s = ws(plus_dm, period); mdm_s = ws(minus_dm, period)
+        ts, ps, ms = ws(tr), ws(pdm), ws(mdm)
         with np.errstate(invalid="ignore", divide="ignore"):
-            pdi = np.where(tr_s > 0, 100*pdm_s/tr_s, 0)
-            mdi = np.where(tr_s > 0, 100*mdm_s/tr_s, 0)
-            dx  = np.where((pdi+mdi) > 0, 100*np.abs(pdi-mdi)/(pdi+mdi), 0)
+            pdi = np.where(ts>0, 100*ps/ts, 0)
+            mdi = np.where(ts>0, 100*ms/ts, 0)
+            dx  = np.where((pdi+mdi)>0, 100*np.abs(pdi-mdi)/(pdi+mdi), 0)
         adx = np.zeros(n)
-        if 2*period < n:
-            adx[2*period] = dx[period:2*period+1].mean()
-            for i in range(2*period+1, n):
-                adx[i] = (adx[i-1]*(period-1) + dx[i]) / period
+        if 2*p < n:
+            adx[2*p] = dx[p:2*p+1].mean()
+            for i in range(2*p+1, n): adx[i] = (adx[i-1]*(p-1)+dx[i])/p
 
         return float(adx[-1]), float(pdi[-1]), float(mdi[-1]), rsi
 
     @classmethod
-    def compute(cls, trading_day: date, hourly_df: pd.DataFrame,
-                daily_df: pd.DataFrame) -> Optional[Dict]:
-        """
-        Compute all indicators as-of pre-market on trading_day.
-        Uses data strictly BEFORE trading_day.
-
-        Returns dict with: regime, confluence, adx, plus_di, minus_di, rsi, atr,
-                           ema8..ema233, clouds, trend_label
-        """
-        # Slice: everything before this trading day
-        h = hourly_df[hourly_df.index.date < trading_day].copy()
-        d = daily_df[daily_df.index.date < trading_day].copy()
-
+    def compute(cls, day: date, h_df: pd.DataFrame, d_df: pd.DataFrame) -> Optional[Dict]:
+        h = h_df[h_df.index.date < day]
+        d = d_df[d_df.index.date < day]
         if len(h) < 55 or len(d) < 50:
             return None
 
-        close_h = h["Close"]
-        close_d = d["Close"]
+        ch, cd = h["Close"], d["Close"]
+        price  = float(ch.iloc[-1])
 
-        # ── All 10 EMAs (on hourly data) ─────────────────────────────
-        e8   = cls._ema_val(close_h, 8)
-        e9   = cls._ema_val(close_h, 9)
-        e20  = cls._ema_val(close_h, 20)
-        e21  = cls._ema_val(close_h, 21)
-        e34  = cls._ema_val(close_h, 34)
-        e50  = cls._ema_val(close_h, 50)
-        e55  = cls._ema_val(close_h, 55)
-        e89  = cls._ema_val(close_h, 89)
-        e120 = cls._ema_val(close_h, 120)
-        # EMA 233: use daily if not enough hourly bars
-        e233 = cls._ema_val(close_h, 233) if len(close_h) >= 233 \
-               else cls._ema_val(close_d, 233)
+        # 10 EMAs
+        e8,e9     = cls._ema(ch,8),   cls._ema(ch,9)
+        e20,e21   = cls._ema(ch,20),  cls._ema(ch,21)
+        e34,e50   = cls._ema(ch,34),  cls._ema(ch,50)
+        e55,e89   = cls._ema(ch,55),  cls._ema(ch,89)
+        e120      = cls._ema(ch,120)
+        e233      = cls._ema(ch,233) if len(ch)>=233 else cls._ema(cd,233)
 
-        # Last known price (yesterday's close)
-        price = float(close_h.iloc[-1])
+        def pos(p,a,b):
+            t,bt = max(a,b), min(a,b)
+            return "ABOVE" if p>t else ("BELOW" if p<bt else "INSIDE")
 
-        # ── Cloud positions ───────────────────────────────────────────
-        def cloud_pos(p, a, b):
-            top, bot = max(a, b), min(a, b)
-            if p > top: return "ABOVE"
-            if p < bot: return "BELOW"
-            return "INSIDE"
+        c1,c2,c3 = pos(price,e8,e9), pos(price,e20,e21), pos(price,e34,e50)
+        c4,c5    = pos(price,e55,e89), pos(price,e120,e233)
 
-        c1 = cloud_pos(price, e8,   e9)
-        c2 = cloud_pos(price, e20,  e21)
-        c3 = cloud_pos(price, e34,  e50)   # KEY
-        c4 = cloud_pos(price, e55,  e89)
-        c5 = cloud_pos(price, e120, e233)
+        # Trend label: EMA8 x EMA34
+        e8s  = cls._ema_s(ch,8)
+        e34s = cls._ema_s(ch,34)
+        label = "NONE"
+        if len(e8s)>=2:
+            dn, dp = float(e8s.iloc[-1]-e34s.iloc[-1]), float(e8s.iloc[-2]-e34s.iloc[-2])
+            if dp<=0 < dn: label = "BULLISH_CROSS"
+            elif dp>=0 > dn: label = "BEARISH_CROSS"
 
-        # ── Trend label: EMA8 x EMA34 crossover ──────────────────────
-        ema8_s  = cls._ema_series(close_h, 8)
-        ema34_s = cls._ema_series(close_h, 34)
-        trend_label = "NONE"
-        if len(ema8_s) >= 2:
-            diff_now  = float(ema8_s.iloc[-1]  - ema34_s.iloc[-1])
-            diff_prev = float(ema8_s.iloc[-2]   - ema34_s.iloc[-2])
-            if diff_prev <= 0 < diff_now:
-                trend_label = "BULLISH_CROSS"
-            elif diff_prev >= 0 > diff_now:
-                trend_label = "BEARISH_CROSS"
-
-        # ── Regime ───────────────────────────────────────────────────
+        # Regime
         if c3 == "INSIDE":
-            regime = "SIDEWAYS"
-            confluence = 0
+            regime, conf = "SIDEWAYS", 0
         else:
             if c3 == "ABOVE":
-                direction = "BULLISH"
-                score = 2  # c3 counts double
-                if c1 == "ABOVE": score += 1
-                if c2 == "ABOVE": score += 1
-                if c4 == "ABOVE": score += 1
-                if c5 == "ABOVE": score += 1
-                if trend_label == "BULLISH_CROSS": score += 1
-                # Conflict: fast bullish but slow clouds bearish
-                if c4 == "BELOW" and c5 == "BELOW":
-                    regime = "SIDEWAYS"
-                    confluence = 2
-                    return dict(regime=regime, confluence=confluence,
-                                adx=0, plus_di=0, minus_di=0, rsi=50,
-                                atr=cls._atr(d), price=price,
-                                trend_label=trend_label)
+                sc = 2+sum([c1=="ABOVE",c2=="ABOVE",c4=="ABOVE",c5=="ABOVE",label=="BULLISH_CROSS"])
+                if c4=="BELOW" and c5=="BELOW":
+                    regime, conf = "SIDEWAYS", 2
+                else:
+                    regime, conf = "BULLISH", max(1,min(5,round((sc-1)*(5/6))))
             else:
-                direction = "BEARISH"
-                score = 2
-                if c1 == "BELOW": score += 1
-                if c2 == "BELOW": score += 1
-                if c4 == "BELOW": score += 1
-                if c5 == "BELOW": score += 1
-                if trend_label == "BEARISH_CROSS": score += 1
-                if c4 == "ABOVE" and c5 == "ABOVE":
-                    regime = "SIDEWAYS"
-                    confluence = 2
-                    return dict(regime=regime, confluence=confluence,
-                                adx=0, plus_di=0, minus_di=0, rsi=50,
-                                atr=cls._atr(d), price=price,
-                                trend_label=trend_label)
+                sc = 2+sum([c1=="BELOW",c2=="BELOW",c4=="BELOW",c5=="BELOW",label=="BEARISH_CROSS"])
+                if c4=="ABOVE" and c5=="ABOVE":
+                    regime, conf = "SIDEWAYS", 2
+                else:
+                    regime, conf = "BEARISH", max(1,min(5,round((sc-1)*(5/6))))
 
-            regime    = direction
-            # Normalize 2-7 → 1-5
-            confluence = max(1, min(5, round((score - 1) * (5/6))))
-
-        # ── ADX / RSI ─────────────────────────────────────────────────
-        adx, pdi, mdi, rsi = cls._adx_rsi(close_h, h["High"], h["Low"])
-
-        # ── ATR (daily) ───────────────────────────────────────────────
+        adx, pdi, mdi, rsi = cls._adx_rsi(ch, h["High"], h["Low"])
         atr = cls._atr(d)
 
-        return dict(
-            regime=regime, confluence=confluence,
-            adx=adx, plus_di=pdi, minus_di=mdi, rsi=rsi,
-            atr=atr, price=price, trend_label=trend_label,
-        )
+        return dict(regime=regime, confluence=conf, adx=adx, plus_di=pdi,
+                    minus_di=mdi, rsi=rsi, atr=atr, price=price, label=label)
 
 
 # ============================================================================
-# BOT ROUTER (simplified — mirrors multi_bot_engine.py logic)
+# BOT ROUTER
 # ============================================================================
 
-def route_bot(ind: Dict, vix: float) -> BotType:
-    """Select bot type from point-in-time indicators + VIX."""
-    if vix >= 28:
-        return BotType.NO_TRADE
+def route(ind: Dict, vix: float, cfg: BacktestConfig) -> BotType:
+    r, conf = ind["regime"], ind["confluence"]
+    adx     = ind["adx"]
+    pdi, mdi, rsi = ind["plus_di"], ind["minus_di"], ind["rsi"]
+    di_gap  = abs(pdi - mdi)
 
-    regime     = ind["regime"]
-    confluence = ind["confluence"]
-    adx        = ind["adx"]
-    pdi        = ind["plus_di"]
-    mdi        = ind["minus_di"]
-    rsi        = ind["rsi"]
-
-    if regime == "SIDEWAYS":
+    if r == "SIDEWAYS":
+        if adx > cfg.adx_sideways_max: return BotType.NO_TRADE
+        if vix > cfg.vix_max_condor:   return BotType.NO_TRADE
         return BotType.SIDEWAYS
 
-    if regime == "BULLISH":
-        if confluence >= 3 and adx > 25 and pdi > mdi and rsi > 55 and vix < 28:
-            return BotType.BULLISH
-        return BotType.NO_TRADE
+    if r == "BULLISH":
+        if conf < cfg.confluence_min:          return BotType.NO_TRADE
+        if adx < cfg.adx_directional_min:      return BotType.NO_TRADE
+        if pdi < mdi:                          return BotType.NO_TRADE
+        if rsi < cfg.rsi_bull_min:             return BotType.NO_TRADE
+        if di_gap < cfg.di_gap_min:            return BotType.NO_TRADE
+        if vix > cfg.vix_max_dir:              return BotType.NO_TRADE
+        return BotType.BULLISH
 
-    if regime == "BEARISH":
-        if confluence >= 3 and adx > 25 and mdi > pdi and rsi < 45 and vix < 28:
-            return BotType.BEARISH
-        return BotType.NO_TRADE
+    if r == "BEARISH":
+        if conf < cfg.confluence_min:          return BotType.NO_TRADE
+        if adx < cfg.adx_directional_min:      return BotType.NO_TRADE
+        if mdi < pdi:                          return BotType.NO_TRADE
+        if rsi > cfg.rsi_bear_max:             return BotType.NO_TRADE
+        if di_gap < cfg.di_gap_min:            return BotType.NO_TRADE
+        if vix > cfg.vix_max_dir:              return BotType.NO_TRADE
+        return BotType.BEARISH
 
     return BotType.NO_TRADE
 
 
 # ============================================================================
-# PREMIUM ESTIMATOR
+# PREMIUM MODEL
 # ============================================================================
 
-class PremiumEstimator:
-    """
-    Estimates option credit/debit using VIX-scaled model.
-    No actual option chain data — uses empirical 0DTE SPX pricing.
+def condor_credit_per_side(width: float, vix: float) -> float:
+    """Empirical 0DTE 20-delta credit — scales with VIX."""
+    return round(min(0.15 * width * (vix/15), width * 0.32), 2)
 
-    Calibration (based on typical 0DTE SPX market pricing):
-        VIX 15 → 20-delta $5 spread credit ≈ $0.75  (15% of width)
-        VIX 20 → 20-delta $5 spread credit ≈ $1.00  (20% of width)
-        VIX 25 → 20-delta $5 spread credit ≈ $1.25  (25% of width)
-        ATM $10 debit spread ≈ $4.00–$5.00           (40-50% of width)
-    """
-
-    @staticmethod
-    def condor_credit(spread_width: float, vix: float) -> float:
-        """Iron condor: total credit for one side (either calls or puts)"""
-        base_pct = 0.15   # 15% of width at VIX=15
-        vol_adj  = vix / 15
-        credit   = base_pct * spread_width * vol_adj
-        return round(min(credit, spread_width * 0.35), 2)  # cap at 35%
-
-    @staticmethod
-    def directional_debit(spread_width: float, vix: float) -> float:
-        """Bull call / bear put spread: net debit"""
-        base_pct = 0.35   # 35% of width at VIX=15
-        vol_adj  = vix / 15
-        debit    = base_pct * spread_width * vol_adj
-        return round(min(debit, spread_width * 0.55), 2)   # cap at 55%
+def directional_debit(width: float, vix: float) -> float:
+    """Empirical 0DTE ATM debit spread cost."""
+    return round(min(0.30 * width * (vix/15), width * 0.50), 2)
 
 
 # ============================================================================
 # TRADE SIMULATOR
 # ============================================================================
 
-class TradeSimulator:
-    """
-    Selects strikes and calculates P&L for each bot type.
-    Uses ATR to size the expected daily move for strike placement.
-    """
+def _round5(x: float) -> float:
+    return round(round(x/5)*5, 0)
 
-    SPREAD_WIDTH_CONDOR     = 5.0    # $5 wide iron condor
-    SPREAD_WIDTH_DIRECTIONAL= 10.0   # $10 wide directional spread
-    STOP_LOSS_MULTIPLIER    = 2.0    # Stop condor at 2× credit received
+def sim_condor(entry: float, atr: float, vix: float,
+               intraday: pd.DataFrame, exit_price: float,
+               cfg: BacktestConfig) -> Tuple[float, ExitReason, Dict]:
+    """Simulate iron condor trade with configurable stop logic."""
 
-    @staticmethod
-    def _round_strike(price: float, width: float = 5.0) -> float:
-        return round(round(price / width) * width, 0)
+    half_move  = atr * 0.5 * cfg.condor_atr_mult
+    call_sell  = _round5(entry + half_move)
+    call_buy   = call_sell + 5
+    put_sell   = _round5(entry - half_move)
+    put_buy    = put_sell - 5
 
-    @classmethod
-    def build_condor(cls, entry: float, atr: float, vix: float) -> Dict:
-        """Iron condor: short strikes at ±0.75× expected half-day move"""
-        half_day_move = atr * 0.5 * 0.65   # ~65% of half ATR
-        half_day_move = max(half_day_move, atr * 0.3)
+    credit_side  = condor_credit_per_side(5, vix)
+    total_credit = credit_side * 2
+    max_loss     = 5 - credit_side   # per side (worst case one side blown)
+    stop_cost    = total_credit * 2  # stop at 2× credit (standard condor rule)
 
-        call_sell = cls._round_strike(entry + half_day_move)
-        call_buy  = call_sell + cls.SPREAD_WIDTH_CONDOR
-        put_sell  = cls._round_strike(entry - half_day_move)
-        put_buy   = put_sell - cls.SPREAD_WIDTH_CONDOR
+    strikes = dict(cs=call_sell, cb=call_buy, ps=put_sell, pb=put_buy,
+                   credit=total_credit)
 
-        credit_side = PremiumEstimator.condor_credit(cls.SPREAD_WIDTH_CONDOR, vix)
-        total_credit = credit_side * 2
-        max_loss     = (cls.SPREAD_WIDTH_CONDOR - credit_side)  # per side, worst case
+    # ── Intraday monitoring ────────────────────────────────────────────
+    between_11_and_230 = intraday[(intraday.index.hour >= 11) &
+                                  ((intraday.index.hour < 14) |
+                                   ((intraday.index.hour == 14) &
+                                    (intraday.index.minute <= 30)))]
 
-        return dict(
-            call_sell=call_sell, call_buy=call_buy,
-            put_sell=put_sell,   put_buy=put_buy,
-            credit=total_credit, max_loss_per_side=max_loss,
-            spread_width=cls.SPREAD_WIDTH_CONDOR,
-        )
+    for _, bar in between_11_and_230.iterrows():
+        if cfg.condor_stop_on_close:
+            # Stop only if hourly bar CLOSES beyond short strike
+            breached = bar["Close"] > call_sell or bar["Close"] < put_sell
+        else:
+            # Original: stop on any intraday touch
+            breached = bar["High"] >= call_sell or bar["Low"] <= put_sell
 
-    @classmethod
-    def build_bull_call(cls, entry: float, vix: float) -> Dict:
-        buy_strike  = cls._round_strike(entry)
-        sell_strike = buy_strike + cls.SPREAD_WIDTH_DIRECTIONAL
-        debit       = PremiumEstimator.directional_debit(cls.SPREAD_WIDTH_DIRECTIONAL, vix)
-        max_profit  = cls.SPREAD_WIDTH_DIRECTIONAL - debit
-        return dict(
-            buy_strike=buy_strike, sell_strike=sell_strike,
-            debit=debit, max_profit=max_profit,
-            spread_width=cls.SPREAD_WIDTH_DIRECTIONAL,
-        )
+        if breached:
+            return -stop_cost * 100, ExitReason.STOP_LOSS, strikes
 
-    @classmethod
-    def build_bear_put(cls, entry: float, vix: float) -> Dict:
-        buy_strike  = cls._round_strike(entry)
-        sell_strike = buy_strike - cls.SPREAD_WIDTH_DIRECTIONAL
-        debit       = PremiumEstimator.directional_debit(cls.SPREAD_WIDTH_DIRECTIONAL, vix)
-        max_profit  = cls.SPREAD_WIDTH_DIRECTIONAL - debit
-        return dict(
-            buy_strike=buy_strike, sell_strike=sell_strike,
-            debit=debit, max_profit=max_profit,
-            spread_width=cls.SPREAD_WIDTH_DIRECTIONAL,
-        )
+    # ── Early profit take at 2:30pm ────────────────────────────────────
+    if cfg.condor_early_exit:
+        bar_230 = between_11_and_230[between_11_and_230.index.hour == 14]
+        if len(bar_230) > 0:
+            p230 = float(bar_230.iloc[-1]["Close"])
+            if put_sell < p230 < call_sell:  # still inside
+                pnl = total_credit * cfg.condor_early_exit_pct * 100
+                return pnl, ExitReason.PROFIT_TAKE, strikes
 
-    @classmethod
-    def calc_condor_pnl(cls, strikes: Dict,
-                         intraday_high: float, intraday_low: float,
-                         exit_price: float) -> Tuple[float, ExitReason]:
-        """
-        P&L for iron condor.
-        Checks intraday high/low for stop-loss events first.
-        """
-        credit   = strikes["credit"]
-        max_loss = strikes["max_loss_per_side"]
-        stop_at  = credit * cls.STOP_LOSS_MULTIPLIER   # stop if mark = 2× credit
+    # ── Expiry settlement ──────────────────────────────────────────────
+    call_loss = min(max(exit_price - call_sell, 0), 5)
+    put_loss  = min(max(put_sell - exit_price,  0), 5)
+    pnl = (total_credit - call_loss - put_loss) * 100
+    return pnl, ExitReason.EXPIRY, strikes
 
-        # Stop if short strike touched intraday
-        if intraday_high >= strikes["call_sell"] or intraday_low <= strikes["put_sell"]:
-            return -stop_at * 100, ExitReason.STOP_LOSS
 
-        # At expiry:
-        call_breach = max(0, exit_price - strikes["call_sell"])
-        put_breach  = max(0, strikes["put_sell"] - exit_price)
+def sim_directional(bot: BotType, entry: float, atr: float, vix: float,
+                    intraday: pd.DataFrame, exit_price: float,
+                    cfg: BacktestConfig) -> Tuple[float, ExitReason, Dict]:
+    """Simulate bull call or bear put spread with ATR-based stop."""
 
-        call_loss = min(call_breach, strikes["spread_width"])
-        put_loss  = min(put_breach,  strikes["spread_width"])
+    w     = cfg.dir_spread_width
+    debit = directional_debit(w, vix)
+    stop  = atr * cfg.dir_stop_atr_mult  # ATR-based stop distance
 
-        pnl = (credit - call_loss - put_loss) * 100
-        return pnl, ExitReason.EXPIRY
+    if bot == BotType.BULLISH:
+        buy_s, sell_s = _round5(entry), _round5(entry) + w
+    else:
+        buy_s, sell_s = _round5(entry), _round5(entry) - w
 
-    @classmethod
-    def calc_bull_call_pnl(cls, strikes: Dict,
-                            intraday_low: float, entry_price: float,
-                            exit_price: float) -> Tuple[float, ExitReason]:
-        """P&L for bull call spread."""
-        debit = strikes["debit"]
+    strikes = dict(buy=buy_s, sell=sell_s, debit=debit)
 
-        # Stop: SPX drops below buy_strike - 0.3% intraday
-        stop_level = entry_price * (1 - 0.003)
-        if intraday_low <= stop_level:
-            stop_loss = debit * 0.5 * 100
-            return -stop_loss, ExitReason.STOP_LOSS
+    # ── Intraday stop check ────────────────────────────────────────────
+    between = intraday[(intraday.index.hour >= 11) & (intraday.index.hour <= 14)]
 
-        intrinsic = max(0, min(exit_price - strikes["buy_strike"],
-                               strikes["spread_width"]))
-        pnl = (intrinsic - debit) * 100
-        return pnl, ExitReason.EXPIRY
+    for _, bar in between.iterrows():
+        if bot == BotType.BULLISH:
+            # Stop if market drops more than (stop) points below entry
+            if bar["Low"] <= entry - stop:
+                return -(debit * 0.50) * 100, ExitReason.STOP_LOSS, strikes
+        else:
+            # Stop if market rises more than (stop) points above entry
+            if bar["High"] >= entry + stop:
+                return -(debit * 0.50) * 100, ExitReason.STOP_LOSS, strikes
 
-    @classmethod
-    def calc_bear_put_pnl(cls, strikes: Dict,
-                           intraday_high: float, entry_price: float,
-                           exit_price: float) -> Tuple[float, ExitReason]:
-        """P&L for bear put spread."""
-        debit = strikes["debit"]
+    # ── Expiry ─────────────────────────────────────────────────────────
+    if bot == BotType.BULLISH:
+        intrinsic = max(0, min(exit_price - buy_s, w))
+    else:
+        intrinsic = max(0, min(buy_s - exit_price, w))
 
-        # Stop: SPX rises above buy_strike + 0.3% intraday
-        stop_level = entry_price * (1 + 0.003)
-        if intraday_high >= stop_level:
-            stop_loss = debit * 0.5 * 100
-            return -stop_loss, ExitReason.STOP_LOSS
-
-        intrinsic = max(0, min(strikes["buy_strike"] - exit_price,
-                               strikes["spread_width"]))
-        pnl = (intrinsic - debit) * 100
-        return pnl, ExitReason.EXPIRY
+    pnl = (intrinsic - debit) * 100
+    return pnl, ExitReason.EXPIRY, strikes
 
 
 # ============================================================================
-# INTRADAY BAR HELPERS
-# ============================================================================
-
-def get_bar(day_df: pd.DataFrame, target_hour: int,
-            target_minute: int = 0) -> Optional[pd.Series]:
-    """Get the intraday bar closest to the target hour:minute"""
-    candidates = day_df[
-        (day_df.index.hour == target_hour) &
-        (day_df.index.minute >= target_minute - 30) &
-        (day_df.index.minute <= target_minute + 30)
-    ]
-    return candidates.iloc[0] if len(candidates) > 0 else None
-
-
-def get_range(day_df: pd.DataFrame,
-              start_hour: int, end_hour: int) -> pd.DataFrame:
-    """Get intraday bars between start and end hours"""
-    return day_df[
-        (day_df.index.hour >= start_hour) &
-        (day_df.index.hour <= end_hour)
-    ]
-
-
-# ============================================================================
-# MAIN BACKTESTER
+# BACKTESTER CORE
 # ============================================================================
 
 class RealBacktester:
-    """
-    Orchestrates the full historical simulation.
-    Usage:
-        bt = RealBacktester()
-        bt.run()
-    """
 
-    def __init__(self, account_size: float = 25000):
-        self.account_size = account_size
-        self.loader       = DataLoader()
-        self.trades: List[TradeRecord] = []
+    def __init__(self, loader: DataLoader):
+        self.loader = loader
 
-    def run(self, start_date: Optional[date] = None,
-                  end_date:   Optional[date] = None) -> List[TradeRecord]:
+    def run(self, cfg: BacktestConfig,
+            start: Optional[date] = None,
+            end:   Optional[date] = None,
+            verbose: bool = False) -> List[TradeRecord]:
 
-        if not self.loader.load(verbose=True):
-            return []
+        days = self.loader.trading_days()
+        if start: days = [d for d in days if d >= start]
+        if end:   days = [d for d in days if d <= end]
+        days = days[50:]  # EMA burn-in
 
-        trading_days = self.loader.get_trading_days()
+        trades     = []
+        skip_data  = skip_gate = 0
 
-        # Default to available hourly range
-        if start_date is None:
-            start_date = trading_days[50]   # leave burn-in for EMAs
-        if end_date is None:
-            end_date = trading_days[-1]
-
-        trading_days = [d for d in trading_days if start_date <= d <= end_date]
-        total        = len(trading_days)
-
-        print(f"\nBacktesting {total} trading days "
-              f"({start_date} → {end_date})...\n")
-
-        self.trades = []
-        skipped_data = 0
-        skipped_gate = 0
-
-        for i, day in enumerate(trading_days):
-            if (i+1) % 50 == 0:
-                wins = sum(1 for t in self.trades if t.pnl > 0)
-                n    = len(self.trades)
-                wr   = wins/n if n > 0 else 0
-                print(f"  {i+1}/{total} days processed | "
-                      f"{n} trades | {wr:.0%} WR | "
-                      f"${sum(t.pnl for t in self.trades):,.0f} P&L")
-
-            # ── Point-in-time indicators ──────────────────────────────
-            ind = PointInTime.compute(day, self.loader.hourly_df,
-                                           self.loader.daily_df)
+        for day in days:
+            # Point-in-time indicators
+            ind = PointInTime.compute(day, self.loader.hourly_df, self.loader.daily_df)
             if ind is None:
-                skipped_data += 1
-                continue
+                skip_data += 1; continue
 
-            # ── VIX gate ──────────────────────────────────────────────
-            vix_row = self.loader.vix_df[self.loader.vix_df.index.date == day]
-            vix     = float(vix_row["Close"].iloc[-1]) if len(vix_row) > 0 else 18.0
+            # VIX
+            vr  = self.loader.vix_df[self.loader.vix_df.index.date == day]
+            vix = float(vr["Close"].iloc[-1]) if len(vr) > 0 else 18.0
 
-            # ── Bot routing ───────────────────────────────────────────
-            bot = route_bot(ind, vix)
+            # Route
+            bot = route(ind, vix, cfg)
             if bot == BotType.NO_TRADE:
-                skipped_gate += 1
-                continue
+                skip_gate += 1; continue
 
-            # ── Intraday data for this day ────────────────────────────
-            day_df = self.loader.hourly_df[
-                self.loader.hourly_df.index.date == day
-            ]
+            # Day's intraday data
+            day_df = self.loader.hourly_df[self.loader.hourly_df.index.date == day]
             if len(day_df) < 4:
-                skipped_data += 1
-                continue
+                skip_data += 1; continue
 
-            # ── Entry: 11am bar ───────────────────────────────────────
-            entry_bar = get_bar(day_df, target_hour=11)
-            if entry_bar is None:
-                entry_bar = day_df.iloc[2] if len(day_df) > 2 else day_df.iloc[0]
-            entry_price = float(entry_bar["Close"])
+            # Entry bar (11am)
+            entry_bars = day_df[(day_df.index.hour==11)]
+            if len(entry_bars) == 0:
+                entry_bars = day_df.iloc[[min(2, len(day_df)-1)]]
+            entry_price = float(entry_bars.iloc[0]["Close"])
 
-            # ── Exit: 3:30pm bar ──────────────────────────────────────
-            exit_bar  = get_bar(day_df, target_hour=15, target_minute=30)
-            if exit_bar is None:
-                exit_bar = day_df.iloc[-1]
-            exit_price = float(exit_bar["Close"])
+            # Exit bar (3:30pm)
+            exit_bars = day_df[(day_df.index.hour==15) & (day_df.index.minute>=30)]
+            exit_price = float(exit_bars.iloc[0]["Close"]) if len(exit_bars)>0 \
+                         else float(day_df.iloc[-1]["Close"])
 
-            # ── Intraday range between entry and exit ─────────────────
-            intraday = get_range(day_df, 11, 15)
-            intraday_high = float(intraday["High"].max()) if len(intraday) > 0 else entry_price
-            intraday_low  = float(intraday["Low"].min())  if len(intraday) > 0 else entry_price
+            # Intraday (11am–3:30pm)
+            intraday = day_df[(day_df.index.hour >= 11) & (day_df.index.hour <= 15)]
 
-            # ── Strikes + P&L ─────────────────────────────────────────
-            atr = ind["atr"]
-
+            # Simulate
             if bot == BotType.SIDEWAYS:
-                strikes = TradeSimulator.build_condor(entry_price, atr, vix)
-                pnl, reason = TradeSimulator.calc_condor_pnl(
-                    strikes, intraday_high, intraday_low, exit_price)
+                pnl, reason, strikes = sim_condor(
+                    entry_price, ind["atr"], vix, intraday, exit_price, cfg)
                 rec = TradeRecord(
                     date=day, bot_type=bot,
                     entry_price=entry_price, exit_price=exit_price,
-                    strike_a=strikes["call_sell"], strike_b=strikes["call_buy"],
-                    strike_c=strikes["put_sell"],  strike_d=strikes["put_buy"],
+                    pnl=pnl, exit_reason=reason,
                     credit_or_debit=strikes["credit"],
-                    pnl=pnl, exit_reason=reason,
-                    vix=vix, atr=atr,
-                    regime=ind["regime"], confluence=ind["confluence"],
-                    adx=ind["adx"], rsi=ind["rsi"],
+                    strike_a=strikes["cs"], strike_b=strikes["cb"],
+                    strike_c=strikes["ps"], strike_d=strikes["pb"],
+                    vix=vix, atr=ind["atr"], adx=ind["adx"],
+                    rsi=ind["rsi"], confluence=ind["confluence"],
                 )
-
-            elif bot == BotType.BULLISH:
-                strikes = TradeSimulator.build_bull_call(entry_price, vix)
-                pnl, reason = TradeSimulator.calc_bull_call_pnl(
-                    strikes, intraday_low, entry_price, exit_price)
+            else:
+                pnl, reason, strikes = sim_directional(
+                    bot, entry_price, ind["atr"], vix, intraday, exit_price, cfg)
                 rec = TradeRecord(
                     date=day, bot_type=bot,
                     entry_price=entry_price, exit_price=exit_price,
-                    strike_a=strikes["buy_strike"], strike_b=strikes["sell_strike"],
-                    credit_or_debit=-strikes["debit"],
                     pnl=pnl, exit_reason=reason,
-                    vix=vix, atr=atr,
-                    regime=ind["regime"], confluence=ind["confluence"],
-                    adx=ind["adx"], rsi=ind["rsi"],
+                    credit_or_debit=-strikes["debit"],
+                    strike_a=strikes["buy"], strike_b=strikes["sell"],
+                    vix=vix, atr=ind["atr"], adx=ind["adx"],
+                    rsi=ind["rsi"], confluence=ind["confluence"],
                 )
 
-            else:  # BEARISH
-                strikes = TradeSimulator.build_bear_put(entry_price, vix)
-                pnl, reason = TradeSimulator.calc_bear_put_pnl(
-                    strikes, intraday_high, entry_price, exit_price)
-                rec = TradeRecord(
-                    date=day, bot_type=bot,
-                    entry_price=entry_price, exit_price=exit_price,
-                    strike_a=strikes["buy_strike"], strike_b=strikes["sell_strike"],
-                    credit_or_debit=-strikes["debit"],
-                    pnl=pnl, exit_reason=reason,
-                    vix=vix, atr=atr,
-                    regime=ind["regime"], confluence=ind["confluence"],
-                    adx=ind["adx"], rsi=ind["rsi"],
-                )
+            trades.append(rec)
 
-            self.trades.append(rec)
-
-        print(f"\nDone. {len(self.trades)} trades | "
-              f"{skipped_data} skipped (data) | {skipped_gate} skipped (gates)\n")
-        return self.trades
+        if verbose:
+            print(f"  {cfg.name}: {len(trades)} trades | "
+                  f"{skip_gate} gate-blocked | {skip_data} data-skip")
+        return trades
 
 
 # ============================================================================
 # REPORTER
 # ============================================================================
 
-class BacktestReporter:
+def _stats(trades: List[TradeRecord], account: float = 25000) -> Dict:
+    if not trades:
+        return {}
+    df  = pd.DataFrame([vars(t) for t in trades])
+    pnl = df["pnl"]
+    n   = len(df)
+    wr  = (pnl > 0).mean()
+    tot = pnl.sum()
 
-    def __init__(self, trades: List[TradeRecord], account_size: float = 25000):
-        self.trades       = trades
-        self.account_size = account_size
+    equity = pnl.cumsum()
+    dd     = float((equity - equity.cummax()).min())
 
-    def print_report(self):
-        if not self.trades:
-            print("No trades to report.")
-            return
+    daily  = df.groupby("date")["pnl"].sum() / account
+    sharpe = float(daily.mean() / daily.std() * np.sqrt(252)) if daily.std()>0 else 0
 
-        df = pd.DataFrame([vars(t) for t in self.trades])
-        df["year"]  = pd.to_datetime(df["date"]).dt.year
-        df["month"] = pd.to_datetime(df["date"]).dt.to_period("M")
-        df["win"]   = df["pnl"] > 0
+    stops  = (df["exit_reason"] == ExitReason.STOP_LOSS).mean()
+    profit_takes = (df["exit_reason"] == ExitReason.PROFIT_TAKE).mean()
 
-        sep = "=" * 68
+    # bot_type is stored as BotType enum — convert for comparison
+    df["_bot_str"] = df["bot_type"].apply(
+        lambda x: x.value if hasattr(x, "value") else str(x))
+    by_bot = {}
+    for bot in ["SIDEWAYS","BULLISH","BEARISH"]:
+        sub = df[df["_bot_str"] == bot]
+        if len(sub) > 0:
+            by_bot[bot] = dict(n=len(sub), wr=(sub["pnl"]>0).mean(),
+                               tot=sub["pnl"].sum(), avg=sub["pnl"].mean())
 
-        # ── Overall ───────────────────────────────────────────────────
-        print(f"\n{sep}")
-        print(f"  BACKTEST RESULTS — 0DTE SPX Multi-Bot Strategy")
-        print(sep)
-        self._section(df, "OVERALL")
+    return dict(n=n, wr=wr, total=tot, roi=tot/account*100,
+                avg=pnl.mean(), best=pnl.max(), worst=pnl.min(),
+                max_dd=dd, sharpe=sharpe, stop_rate=stops,
+                profit_take_rate=profit_takes, by_bot=by_bot)
 
-        # ── By Bot Type ───────────────────────────────────────────────
-        print(f"\n{sep}")
-        print("  BY BOT TYPE")
-        print(sep)
-        for bot in [BotType.SIDEWAYS, BotType.BULLISH, BotType.BEARISH]:
-            sub = df[df["bot_type"] == bot]
-            if len(sub) > 0:
-                self._section(sub, bot.value)
 
-        # ── By Year ───────────────────────────────────────────────────
-        print(f"\n{sep}")
-        print("  BY YEAR")
-        print(sep)
-        for year in sorted(df["year"].unique()):
-            self._section(df[df["year"] == year], str(year))
+def print_comparison(results: Dict[str, Dict]):
+    """Print side-by-side comparison table of all configs."""
+    sep = "═" * 100
 
-        # ── Max Drawdown ──────────────────────────────────────────────
-        equity = df["pnl"].cumsum()
-        rolling_max = equity.cummax()
-        drawdown    = equity - rolling_max
-        max_dd      = float(drawdown.min())
-        max_dd_pct  = max_dd / self.account_size * 100
+    print(f"\n{sep}")
+    print(f"  CONFIG COMPARISON — 0DTE SPX Multi-Bot Strategy")
+    print(sep)
 
-        # ── Sharpe (annualised, assuming 252 trading days) ────────────
-        daily_returns = df.groupby("date")["pnl"].sum() / self.account_size
-        sharpe = float(daily_returns.mean() / daily_returns.std() * np.sqrt(252)) \
-                 if daily_returns.std() > 0 else 0
+    names = list(results.keys())
+    w = 18
 
-        # ── Exit breakdown ────────────────────────────────────────────
-        stops   = (df["exit_reason"] == ExitReason.STOP_LOSS).sum()
-        expiry  = (df["exit_reason"] == ExitReason.EXPIRY).sum()
+    def row(label, fn):
+        line = f"  {label:<26}"
+        for n in names:
+            r = results[n]
+            line += fn(r).rjust(w)
+        print(line)
 
-        print(f"\n{sep}")
-        print("  RISK & QUALITY METRICS")
-        print(sep)
-        print(f"  Max Drawdown     : ${max_dd:>10,.0f}  ({max_dd_pct:.1f}% of account)")
-        print(f"  Sharpe Ratio     : {sharpe:>10.2f}")
-        print(f"  Exited at Expiry : {expiry:>10,} trades ({expiry/len(df):.0%})")
-        print(f"  Stopped Out      : {stops:>10,} trades ({stops/len(df):.0%})")
-        print(f"\n  Note: GEX filter not applied (VIX>25 used as proxy)")
-        print(f"        Actual strategy may perform 5-10% better with live GEX")
-        print(sep + "\n")
+    header = "  " + " " * 26
+    for n in names:
+        header += n.rjust(w)
+    print(header)
+    print("  " + "─"*98)
 
-    def _section(self, df: pd.DataFrame, label: str):
-        n       = len(df)
-        wins    = df["win"].sum()
-        wr      = wins / n if n > 0 else 0
-        total   = df["pnl"].sum()
-        avg     = df["pnl"].mean()
-        best    = df["pnl"].max()
-        worst   = df["pnl"].min()
-        roi     = total / self.account_size * 100
+    row("Trades",           lambda r: str(r["n"]))
+    row("Win Rate",         lambda r: f"{r['wr']:.1%}")
+    row("Total P&L",        lambda r: f"${r['total']:,.0f}")
+    row("ROI",              lambda r: f"{r['roi']:.1f}%")
+    row("Avg P&L / trade",  lambda r: f"${r['avg']:,.0f}")
+    row("Best trade",       lambda r: f"${r['best']:,.0f}")
+    row("Worst trade",      lambda r: f"${r['worst']:,.0f}")
+    row("Max Drawdown",     lambda r: f"${r['max_dd']:,.0f}")
+    row("Sharpe Ratio",     lambda r: f"{r['sharpe']:.2f}")
+    row("Stop-out Rate",    lambda r: f"{r['stop_rate']:.0%}")
+    row("Profit-take Rate", lambda r: f"{r['profit_take_rate']:.0%}")
 
-        print(f"\n  {label}")
-        print(f"    Trades     : {n:>6,}   Win Rate : {wr:>6.1%}")
-        print(f"    Total P&L  : ${total:>10,.0f}   ROI      : {roi:>6.1f}%")
-        print(f"    Avg/Trade  : ${avg:>10,.0f}   Best     : ${best:>8,.0f}")
-        print(f"    Worst      : ${worst:>10,.0f}")
+    print("  " + "─"*98)
+    print("\n  By Bot Type:")
+    for bot in ["SIDEWAYS","BULLISH","BEARISH"]:
+        line = f"    {bot:<24}"
+        for n in names:
+            bb = results[n].get("by_bot",{}).get(bot)
+            if bb:
+                line += f"{bb['n']:>4}T {bb['wr']:>5.0%}WR ${bb['tot']:>8,.0f}".rjust(w)
+            else:
+                line += "     —".rjust(w)
+        print(line)
 
-    def save_csv(self, path: str = "backtest_results.csv"):
-        df = pd.DataFrame([vars(t) for t in self.trades])
-        df["bot_type"]    = df["bot_type"].apply(lambda x: x.value)
-        df["exit_reason"] = df["exit_reason"].apply(lambda x: x.value)
-        df.to_csv(path, index=False)
-        print(f"Results saved to {path}")
+    print(f"\n{sep}\n")
 
-    def equity_curve(self):
-        """Print a simple ASCII equity curve"""
-        df       = pd.DataFrame([vars(t) for t in self.trades])
-        equity   = (df["pnl"].cumsum() + self.account_size).tolist()
-        hi, lo   = max(equity), min(equity)
-        height   = 12
-        width    = min(80, len(equity))
-        step     = max(1, len(equity) // width)
-        sampled  = equity[::step]
 
-        print("\n  Equity Curve")
-        print("  " + "─" * (len(sampled) + 4))
-        for row in range(height, -1, -1):
-            level = lo + (hi - lo) * row / height
-            line  = ""
-            for val in sampled:
-                line += "█" if val >= level else " "
-            label = f"${level:>8,.0f} |" if row % 3 == 0 else " " * 11 + "|"
-            print(f"  {label}{line}")
-        print("  " + " " * 11 + "└" + "─" * len(sampled))
-        start_d = self.trades[0].date
-        end_d   = self.trades[-1].date
-        print(f"  {' '*12}{start_d}{'':>20}{end_d}\n")
+def equity_curve(trades: List[TradeRecord], label: str, account: float = 25000):
+    df      = pd.DataFrame([vars(t) for t in trades])
+    equity  = (df["pnl"].cumsum() + account).tolist()
+    hi, lo  = max(equity), min(equity)
+    width   = 72
+    step    = max(1, len(equity)//width)
+    sampled = equity[::step]
+    height  = 10
+
+    print(f"\n  Equity Curve — {label}")
+    print("  " + "─" * (len(sampled) + 14))
+    for r in range(height, -1, -1):
+        level = lo + (hi - lo) * r / height
+        bar   = "".join("█" if v >= level else " " for v in sampled)
+        lbl   = f"${level:>9,.0f} |" if r % 2 == 0 else " "*12+"|"
+        print(f"  {lbl}{bar}")
+    print("  " + " "*12 + "└" + "─"*len(sampled))
+    print(f"  {'':12} {trades[0].date}{'':>30}{trades[-1].date}\n")
+
+
+# ============================================================================
+# CONFIGS TO TEST
+# ============================================================================
+
+CONFIGS = [
+    # ── A: Loose baseline — trade most signals ────────────────────────
+    # Minimal filters: just regime direction + basic DI check
+    # Condor: close-based stop (always better), intraday touch was broken
+    BacktestConfig(
+        name              = "A-Loose",
+        condor_atr_mult   = 0.75,
+        condor_stop_on_close = True,
+        condor_early_exit = False,
+        adx_sideways_max  = 60.0,      # essentially no ADX filter
+        vix_max_condor    = 35.0,
+        dir_stop_atr_mult = 0.50,      # ~33pts on ATR-65 (~0.55%)
+        adx_directional_min = 10.0,    # very loose
+        rsi_bull_min      = 50.0,
+        rsi_bear_max      = 50.0,
+        confluence_min    = 2,
+        di_gap_min        = 0.0,
+        vix_max_dir       = 35.0,
+    ),
+    # ── B: Medium — add trend quality gates ───────────────────────────
+    BacktestConfig(
+        name              = "B-Medium",
+        condor_atr_mult   = 0.80,
+        condor_stop_on_close = True,
+        condor_early_exit = True,
+        condor_early_exit_pct = 0.60,
+        adx_sideways_max  = 30.0,
+        vix_max_condor    = 22.0,
+        dir_stop_atr_mult = 0.55,
+        adx_directional_min = 18.0,
+        rsi_bull_min      = 53.0,
+        rsi_bear_max      = 47.0,
+        confluence_min    = 3,
+        di_gap_min        = 3.0,
+        vix_max_dir       = 28.0,
+    ),
+    # ── C: Strict — high quality setups only ─────────────────────────
+    BacktestConfig(
+        name              = "C-Strict",
+        condor_atr_mult   = 0.90,
+        condor_stop_on_close = True,
+        condor_early_exit = True,
+        condor_early_exit_pct = 0.65,
+        adx_sideways_max  = 22.0,
+        vix_max_condor    = 19.0,
+        dir_stop_atr_mult = 0.60,
+        adx_directional_min = 22.0,
+        rsi_bull_min      = 55.0,
+        rsi_bear_max      = 45.0,
+        confluence_min    = 3,
+        di_gap_min        = 5.0,
+        vix_max_dir       = 26.0,
+    ),
+    # ── D: Best-of — strict filter + widest stops + early profit take ─
+    BacktestConfig(
+        name              = "D-Best",
+        condor_atr_mult   = 1.00,
+        condor_stop_on_close = True,
+        condor_early_exit = True,
+        condor_early_exit_pct = 0.70,
+        adx_sideways_max  = 20.0,
+        vix_max_condor    = 18.0,
+        dir_stop_atr_mult = 0.65,
+        adx_directional_min = 25.0,
+        rsi_bull_min      = 57.0,
+        rsi_bear_max      = 43.0,
+        confluence_min    = 3,
+        di_gap_min        = 6.0,
+        vix_max_dir       = 25.0,
+    ),
+]
 
 
 # ============================================================================
@@ -840,15 +715,37 @@ class BacktestReporter:
 # ============================================================================
 
 if __name__ == "__main__":
-    print("\n" + "=" * 68)
+    print("\n" + "═"*68)
     print("  Real Backtester — 0DTE SPX Multi-Bot Strategy")
-    print("=" * 68)
+    print("═"*68 + "\n")
 
-    bt      = RealBacktester(account_size=25000)
-    trades  = bt.run()
+    loader = DataLoader()
+    if not loader.load():
+        sys.exit(1)
 
-    if trades:
-        reporter = BacktestReporter(trades, account_size=25000)
-        reporter.print_report()
-        reporter.equity_curve()
-        reporter.save_csv("backtest_results.csv")
+    bt      = RealBacktester(loader)
+    results = {}
+    all_trades = {}
+
+    print("\nRunning 4 parameter configs...\n")
+    for cfg in CONFIGS:
+        trades = bt.run(cfg, verbose=True)
+        if trades:
+            results[cfg.name]    = _stats(trades)
+            all_trades[cfg.name] = trades
+
+    print_comparison(results)
+
+    # Show equity curve for the best config by total P&L
+    best_name = max(results, key=lambda k: results[k]["total"])
+    print(f"  ★ Best config: {best_name} "
+          f"(${results[best_name]['total']:,.0f} total P&L, "
+          f"{results[best_name]['wr']:.0%} win rate)\n")
+    equity_curve(all_trades[best_name], best_name)
+
+    # Save best results to CSV
+    df_out = pd.DataFrame([vars(t) for t in all_trades[best_name]])
+    df_out["bot_type"]    = df_out["bot_type"].apply(lambda x: x.value)
+    df_out["exit_reason"] = df_out["exit_reason"].apply(lambda x: x.value)
+    df_out.to_csv("backtest_results.csv", index=False)
+    print(f"  Results saved → backtest_results.csv\n")
