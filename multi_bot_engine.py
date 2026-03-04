@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 
-from ema_clouds_filter import EMACloudsFilter, MarketRegime, EMACloudAnalysis
+from ema_clouds_filter import EMACloudsFilter, MarketRegime, EMACloudAnalysis, TrendLabel
 
 logger = logging.getLogger(__name__)
 
@@ -326,7 +326,7 @@ class BotRouter:
 
         # ── SIDEWAYS regime ────────────────────────────────────────────
         if ema.regime == MarketRegime.SIDEWAYS:
-            reasons.append(f"Price inside 1-hr EMA cloud (34/50)")
+            reasons.append("Price inside 1-hr EMA cloud (34/50)")
             if not tech.is_trending:
                 reasons.append(f"ADX={tech.adx:.1f} < 25 confirms no trend")
                 conf = 4
@@ -345,11 +345,12 @@ class BotRouter:
 
         # ── BULLISH regime ─────────────────────────────────────────────
         if ema.regime == MarketRegime.BULLISH:
-            if ema.confluence_score < 2:
+            # Confluence now 0-5; require at least 3
+            if ema.confluence_score < 3:
                 return RoutingDecision(
                     bot_type=BotType.NO_TRADE, confidence=2,
                     ema_regime=ema.regime, ema_confluence=ema.confluence_score,
-                    signals=tech, reasons=["Bullish EMA signal but confluence too low (< 2/3)"],
+                    signals=tech, reasons=[f"Bullish EMA but confluence too low ({ema.confluence_score}/5)"],
                 )
 
             if not tech.vix_ok_directional:
@@ -360,8 +361,13 @@ class BotRouter:
                 )
 
             if tech.is_bullish_trend:
-                conf = 3 + min(ema.confluence_score, 2)   # 3-5
-                reasons.append(f"EMA BULLISH {ema.confluence_score}/3 + ADX={tech.adx:.1f} DI+={tech.plus_di:.1f} RSI={tech.rsi:.1f}")
+                # Scale confidence: EMA confluence (0-5) + tech confirmation
+                conf = min(5, round(ema.confluence_score * 0.6 + 2))
+                reasons.append(f"EMA BULLISH {ema.confluence_score}/5 + ADX={tech.adx:.1f} DI+={tech.plus_di:.1f} RSI={tech.rsi:.1f}")
+                # Bonus: fresh bullish trend label crossover
+                if hasattr(ema, 'trend_label') and ema.trend_label == TrendLabel.BULLISH_CROSS:
+                    reasons.append(f"Ripster Trend Label: BULLISH CROSS ({ema.bars_since_cross} bars ago)")
+                    conf = min(5, conf + 1)
                 return RoutingDecision(
                     bot_type=BotType.BULLISH, confidence=conf,
                     ema_regime=ema.regime, ema_confluence=ema.confluence_score,
@@ -372,17 +378,16 @@ class BotRouter:
                     bot_type=BotType.NO_TRADE, confidence=2,
                     ema_regime=ema.regime, ema_confluence=ema.confluence_score,
                     signals=tech,
-                    reasons=["Bullish EMA but ADX/DI/RSI don't confirm — conflicting signal"],
-                    warnings=["Cloud says bullish but technicals unclear — skip to avoid whipsaw"],
+                    reasons=["Bullish EMA but ADX/DI/RSI don't confirm — skip to avoid whipsaw"],
                 )
 
         # ── BEARISH regime ─────────────────────────────────────────────
         if ema.regime == MarketRegime.BEARISH:
-            if ema.confluence_score < 2:
+            if ema.confluence_score < 3:
                 return RoutingDecision(
                     bot_type=BotType.NO_TRADE, confidence=2,
                     ema_regime=ema.regime, ema_confluence=ema.confluence_score,
-                    signals=tech, reasons=["Bearish EMA signal but confluence too low (< 2/3)"],
+                    signals=tech, reasons=[f"Bearish EMA but confluence too low ({ema.confluence_score}/5)"],
                 )
 
             if not tech.vix_ok_directional:
@@ -393,8 +398,11 @@ class BotRouter:
                 )
 
             if tech.is_bearish_trend:
-                conf = 3 + min(ema.confluence_score, 2)
-                reasons.append(f"EMA BEARISH {ema.confluence_score}/3 + ADX={tech.adx:.1f} DI-={tech.minus_di:.1f} RSI={tech.rsi:.1f}")
+                conf = min(5, round(ema.confluence_score * 0.6 + 2))
+                reasons.append(f"EMA BEARISH {ema.confluence_score}/5 + ADX={tech.adx:.1f} DI-={tech.minus_di:.1f} RSI={tech.rsi:.1f}")
+                if hasattr(ema, 'trend_label') and ema.trend_label == TrendLabel.BEARISH_CROSS:
+                    reasons.append(f"Ripster Trend Label: BEARISH CROSS ({ema.bars_since_cross} bars ago)")
+                    conf = min(5, conf + 1)
                 return RoutingDecision(
                     bot_type=BotType.BEARISH, confidence=conf,
                     ema_regime=ema.regime, ema_confluence=ema.confluence_score,
@@ -405,8 +413,7 @@ class BotRouter:
                     bot_type=BotType.NO_TRADE, confidence=2,
                     ema_regime=ema.regime, ema_confluence=ema.confluence_score,
                     signals=tech,
-                    reasons=["Bearish EMA but ADX/DI/RSI don't confirm — conflicting signal"],
-                    warnings=["Cloud says bearish but technicals unclear — skip to avoid whipsaw"],
+                    reasons=["Bearish EMA but ADX/DI/RSI don't confirm — skip to avoid whipsaw"],
                 )
 
         # Fallback
