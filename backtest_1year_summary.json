@@ -1,0 +1,15 @@
+{
+  "total_trades": 163,
+  "sideways": {
+    "count": 64,
+    "win_rate": 1.0
+  },
+  "bullish": {
+    "count": 51,
+    "win_rate": 1.0
+  },
+  "bearish": {
+    "count": 48,
+    "win_rate": 1.0
+  }
+}

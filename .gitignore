@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Logs & data
+*.log
+trades_log.json
+
+# Personal workspace files (OpenClaw agent memory/config)
+MEMORY.md
+USER.md
+SOUL.md
+IDENTITY.md
+HEARTBEAT.md
+AGENTS.md
+TOOLS.md
+BOOTSTRAP.md
+memory/
+browser/
+
+# Secrets
+.env
+*.env
+credentials.json
+
+# OS
+.DS_Store
