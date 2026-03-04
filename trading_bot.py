@@ -281,12 +281,16 @@ class TradingEngine:
     
     def evaluate_trade(self, current_price: float, indicators: IndicatorValues,
                       vix1d_data: VIX1DData, gex: float,
-                      economic_events: List[str]) -> Tuple[BotType, str]:
+                      economic_events: List[str],
+                      current_time: datetime = None) -> Tuple[BotType, str]:
         """Evaluate if we should trade"""
-        
+
+        # Allow callers (e.g. backtester) to pass a historical timestamp
+        eval_time = current_time if current_time is not None else datetime.now()
+
         gates = self.gate_system.evaluate_all_gates(
             gex=gex, vix1d=vix1d_data.vix1d, vix1d_20day_avg=vix1d_data.vix1d_20day_avg,
-            current_time=datetime.now(), economic_events=economic_events
+            current_time=eval_time, economic_events=economic_events
         )
         
         if not gates.trading_allowed:
