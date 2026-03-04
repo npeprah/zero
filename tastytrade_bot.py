@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import math
 
 from ema_clouds_filter import EMACloudsFilter, MarketRegime
+from multi_bot_engine import MultiBotEngine, BotType
 
 # Configure logging
 logging.basicConfig(
@@ -523,6 +524,118 @@ class OrderExecutor:
             logger.error(f"Order submission failed: {e}")
             return None
     
+    def submit_bull_call_spread(
+        self,
+        buy_strike: int,
+        sell_strike: int,
+        contracts: int = 1,
+        expiration: str = None
+    ) -> Optional[Dict]:
+        """
+        Submit Bull Call Spread order.
+        Buy lower strike call (ATM), sell higher strike call (OTM).
+        Net debit trade — directional bullish.
+        """
+        try:
+            url = f"{self.config.API_BASE_URL}/accounts/{self.account_id}/orders"
+
+            legs = [
+                {
+                    "symbol": "SPX",
+                    "quantity": contracts,
+                    "action": "buy_to_open",
+                    "instrument_type": "equity_option",
+                    "expiration_date": expiration,
+                    "strike_price": buy_strike,
+                    "option_type": "call"
+                },
+                {
+                    "symbol": "SPX",
+                    "quantity": contracts,
+                    "action": "sell_to_open",
+                    "instrument_type": "equity_option",
+                    "expiration_date": expiration,
+                    "strike_price": sell_strike,
+                    "option_type": "call"
+                }
+            ]
+
+            payload = {
+                "time_in_force": "day",
+                "order_type": "limit",
+                "legs": legs,
+                "price": None
+            }
+
+            response = requests.post(url, json=payload, headers=self.auth.get_headers())
+            response.raise_for_status()
+
+            order = response.json()
+            order_id = order.get("order_id")
+            logger.info(f"✓ BULL CALL SPREAD submitted: {order_id}")
+            logger.info(f"  Buy {buy_strike}C / Sell {sell_strike}C × {contracts}")
+            return order
+
+        except Exception as e:
+            logger.error(f"Bull call spread submission failed: {e}")
+            return None
+
+    def submit_bear_put_spread(
+        self,
+        buy_strike: int,
+        sell_strike: int,
+        contracts: int = 1,
+        expiration: str = None
+    ) -> Optional[Dict]:
+        """
+        Submit Bear Put Spread order.
+        Buy higher strike put (ATM/near-ATM), sell lower strike put (OTM).
+        Net debit trade — directional bearish.
+        """
+        try:
+            url = f"{self.config.API_BASE_URL}/accounts/{self.account_id}/orders"
+
+            legs = [
+                {
+                    "symbol": "SPX",
+                    "quantity": contracts,
+                    "action": "buy_to_open",
+                    "instrument_type": "equity_option",
+                    "expiration_date": expiration,
+                    "strike_price": buy_strike,
+                    "option_type": "put"
+                },
+                {
+                    "symbol": "SPX",
+                    "quantity": contracts,
+                    "action": "sell_to_open",
+                    "instrument_type": "equity_option",
+                    "expiration_date": expiration,
+                    "strike_price": sell_strike,
+                    "option_type": "put"
+                }
+            ]
+
+            payload = {
+                "time_in_force": "day",
+                "order_type": "limit",
+                "legs": legs,
+                "price": None
+            }
+
+            response = requests.post(url, json=payload, headers=self.auth.get_headers())
+            response.raise_for_status()
+
+            order = response.json()
+            order_id = order.get("order_id")
+            logger.info(f"✓ BEAR PUT SPREAD submitted: {order_id}")
+            logger.info(f"  Buy {buy_strike}P / Sell {sell_strike}P × {contracts}")
+            return order
+
+        except Exception as e:
+            logger.error(f"Bear put spread submission failed: {e}")
+            return None
+
     def close_position(self, order_id: str) -> bool:
         """Close an existing position"""
         try:
@@ -579,117 +692,110 @@ class SPX0DTEBot:
         return False
     
     def run_daily_check(self) -> Optional[Dict]:
-        """Run daily trading check and execute if conditions met"""
+        """
+        Run daily trading check using the full multi-bot engine.
+
+        Routes to:
+            SIDEWAYS  → Iron Condor
+            BULLISH   → Bull Call Spread
+            BEARISH   → Bear Put Spread
+            NO_TRADE  → skip
+
+        All regime detection, technical confirmation, and strike
+        selection is handled by MultiBotEngine.
+        """
         logger.info("=" * 60)
         logger.info(f"Daily check: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("=" * 60)
-        
-        # Check market hours
-        now = datetime.now()
-        hour = now.hour + now.minute / 60
-        
-        if hour < self.config.TRADING_START or hour > self.config.TRADING_END:
-            logger.info(f"Outside trading hours ({self.config.TRADING_START}-{self.config.TRADING_END})")
-            return None
-        
-        # Get SPX price
-        spx_price = self.data.get_spx_quote()
-        if not spx_price:
-            logger.error("Failed to get SPX price")
-            return None
-        
-        logger.info(f"SPX Price: ${spx_price:,.2f}")
-        
-        # Check GEX
+
+        # ── GEX filter (fast/cheap check — run before heavier analysis) ──
         if not GEXFilter.should_trade(self.config):
             logger.warning("GEX filter blocked trade")
             return None
 
-        # ── EMA Clouds Regime Filter ─────────────────────────────────────────
-        if self.config.EMA_CLOUDS_ENABLED:
-            ema_filter = EMACloudsFilter()
-            ema_analysis = ema_filter.get_regime()
+        # ── Multi-bot engine: regime + technicals + strike selection ──────
+        engine = MultiBotEngine(
+            account_size=self.config.ACCOUNT_SIZE,
+            risk_pct=self.config.RISK_PER_TRADE,
+        )
 
-            logger.info(f"EMA Clouds → {ema_analysis.summary()}")
-
-            if self.config.EMA_CLOUDS_REQUIRE_SIDEWAYS:
-                regime = ema_analysis.regime
-                confidence = ema_analysis.confluence_score
-
-                if regime == MarketRegime.SIDEWAYS or regime == MarketRegime.UNKNOWN:
-                    # SIDEWAYS = ideal for iron condor; UNKNOWN = proceed cautiously
-                    logger.info(f"✓ EMA Clouds regime ({regime.value}) — iron condor cleared")
-
-                elif regime in (MarketRegime.BULLISH, MarketRegime.BEARISH) and confidence >= self.config.EMA_CLOUDS_MIN_CONFIDENCE:
-                    logger.warning(
-                        f"✗ EMA Clouds: {regime.value} regime (confidence {confidence}/3) — "
-                        "market is trending, skipping iron condor to avoid directional risk"
-                    )
-                    return None
-
-                else:
-                    # Low-confidence directional signal — proceed but warn
-                    logger.warning(
-                        f"⚠ EMA Clouds: {regime.value} regime but LOW confidence ({confidence}/3) — "
-                        "proceeding with caution"
-                    )
-        # ────────────────────────────────────────────────────────────────────
-
-        # Get 0DTE expiration
+        # Get 0DTE expiration from API first
         expiration = self.data.get_0dte_expiration()
         if not expiration:
             logger.error("No 0DTE expiration found")
             return None
-        
-        logger.info(f"0DTE Expiration: {expiration}")
-        
-        # Select strikes
-        strike_info = StrikeSelector.select_strikes(
-            spx_price, expiration, self.config.TARGET_DELTA, self.config
-        )
-        
-        if not strike_info:
-            logger.error("Strike selection failed")
+
+        setup = engine.analyze(expiration=expiration)
+
+        if setup is None:
+            logger.info("MultiBotEngine returned NO_TRADE — skipping")
             return None
-        
-        logger.info(f"Selected strikes:")
-        logger.info(f"  Call spread: {strike_info['call_sell']}/{strike_info['call_buy']}")
-        logger.info(f"  Put spread:  {strike_info['put_sell']}/{strike_info['put_buy']}")
-        
-        # Calculate contract size based on risk
-        max_loss = self.config.MAX_LOSS_PER_TRADE
-        risk_per_contract = (strike_info['call_buy'] - strike_info['call_sell']) * 100
-        contracts = max(1, int(max_loss / risk_per_contract))
-        
-        logger.info(f"Contract size: {contracts}")
-        
-        # Submit order
-        order = self.executor.submit_iron_condor(
-            strike_info['call_sell'],
-            strike_info['call_buy'],
-            strike_info['put_sell'],
-            strike_info['put_buy'],
-            contracts,
-            expiration
-        )
-        
+
+        bot_type  = setup["bot_type"]
+        strikes   = setup["strikes"]
+        contracts = strikes["contracts"]
+        spx_price = setup["spx_price"]
+
+        # ── Route to the correct order type ──────────────────────────────
+        order = None
+
+        if bot_type == BotType.BULLISH:
+            logger.info(f"→ BULLISH BOT: Buy {strikes['buy_strike']}C / Sell {strikes['sell_strike']}C "
+                        f"× {contracts}")
+            order = self.executor.submit_bull_call_spread(
+                buy_strike=strikes["buy_strike"],
+                sell_strike=strikes["sell_strike"],
+                contracts=contracts,
+                expiration=expiration,
+            )
+
+        elif bot_type == BotType.BEARISH:
+            logger.info(f"→ BEARISH BOT: Buy {strikes['buy_strike']}P / Sell {strikes['sell_strike']}P "
+                        f"× {contracts}")
+            order = self.executor.submit_bear_put_spread(
+                buy_strike=strikes["buy_strike"],
+                sell_strike=strikes["sell_strike"],
+                contracts=contracts,
+                expiration=expiration,
+            )
+
+        else:  # SIDEWAYS
+            logger.info(f"→ SIDEWAYS BOT: Iron Condor "
+                        f"Calls {strikes['call_sell']}/{strikes['call_buy']} "
+                        f"Puts {strikes['put_sell']}/{strikes['put_buy']} "
+                        f"× {contracts}")
+            order = self.executor.submit_iron_condor(
+                call_sell=strikes["call_sell"],
+                call_buy=strikes["call_buy"],
+                put_sell=strikes["put_sell"],
+                put_buy=strikes["put_buy"],
+                contracts=contracts,
+                expiration=expiration,
+            )
+
         if order:
             trade_record = {
-                'timestamp': datetime.now().isoformat(),
-                'spx_price': spx_price,
-                'expiration': expiration,
-                'call_sell': strike_info['call_sell'],
-                'call_buy': strike_info['call_buy'],
-                'put_sell': strike_info['put_sell'],
-                'put_buy': strike_info['put_buy'],
-                'contracts': contracts,
-                'order_id': order.get('order_id'),
-                'status': 'open'
+                "timestamp":    datetime.now().isoformat(),
+                "bot_type":     bot_type.value,
+                "spx_price":    spx_price,
+                "expiration":   expiration,
+                "strikes":      strikes,
+                "contracts":    contracts,
+                "order_id":     order.get("order_id"),
+                "status":       "open",
+                # Signal metadata for logging/analysis
+                "ema_regime":       setup["ema_regime"],
+                "ema_confluence":   setup["ema_confluence"],
+                "adx":              setup["adx"],
+                "rsi":              setup["rsi"],
+                "vix":              setup["vix"],
+                "confidence":       setup["confidence"],
+                "reasons":          setup["reasons"],
             }
             self.trades_log.append(trade_record)
             self._save_trades_log()
             return trade_record
-        
+
         return None
     
     def _save_trades_log(self):
