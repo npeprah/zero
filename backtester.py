@@ -6,6 +6,7 @@ Loads historical data and simulates trading across all three bots
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from typing import Dict
 from trading_bot import TradingEngine, BotType, IndicatorValues, VIX1DData
 
 
@@ -54,13 +55,17 @@ class BacktestEngine:
                 is_normal_vol=row['vix1d'] < 25
             )
             
-            # Evaluate trade
+            # Evaluate trade — pass the row's timestamp so time gate
+            # uses the historical time, not datetime.now()
+            ts = row.get('timestamp', idx)
+            row_time = ts.replace(hour=11, minute=0) if hasattr(ts, 'replace') else datetime.now().replace(hour=11, minute=0)
             bot_type, explanation = self.engine.evaluate_trade(
                 current_price=row['close'],
                 indicators=indicators,
                 vix1d_data=vix1d_data,
                 gex=row.get('gex', 0.5),
-                economic_events=[]
+                economic_events=[],
+                current_time=row_time,
             )
             
             # Simulate trade
@@ -105,24 +110,27 @@ if __name__ == "__main__":
     engine = TradingEngine(account_size=100000)
     backtester = BacktestEngine(engine)
     
-    # Create sample data
-    dates = pd.date_range('2025-01-01', periods=200, freq='D')
+    # Create sample data — weekdays only, GEX positive, valid signals
+    dates = pd.date_range('2025-01-01', periods=200, freq='B')  # 'B' = business days only
+    n = len(dates)
+    close_prices = 5500 + np.random.randn(n).cumsum()
     data = pd.DataFrame({
         'timestamp': dates,
-        'open': 5500 + np.random.randn(200).cumsum(),
-        'high': 5520 + np.random.randn(200).cumsum(),
-        'low': 5480 + np.random.randn(200).cumsum(),
-        'close': 5500 + np.random.randn(200).cumsum(),
-        'volume': 100000 + np.random.randint(-10000, 10000, 200),
-        'sma_20': 5500,
-        'vwap': 5500,
-        'vwap_slope': ['rising'] * 70 + ['falling'] * 70 + ['flat'] * 60,
-        'ema_5': 5500,
-        'ema_40': 5498,
-        'ema_signal': ['bullish'] * 80 + ['bearish'] * 80 + ['intertwined'] * 40,
-        'vix1d': 12 + np.random.randn(200) * 2,
-        'vix1d_20day_avg': 13,
-        'gex': np.random.randn(200),
+        'open':   close_prices - np.abs(np.random.randn(n)),
+        'high':   close_prices + np.abs(np.random.randn(n)) * 2,
+        'low':    close_prices - np.abs(np.random.randn(n)) * 2,
+        'close':  close_prices,
+        'volume': 100000 + np.random.randint(0, 20000, n),
+        'sma_20': close_prices - np.random.randn(n) * 3,
+        'vwap':   close_prices + np.random.randn(n),
+        'vwap_slope':  ['rising'] * 70 + ['falling'] * 70 + ['flat'] * (n - 140),
+        'ema_5':  close_prices + np.random.randn(n) * 0.5,
+        'ema_40': close_prices - np.random.randn(n) * 2,
+        'ema_signal': ['bullish'] * 80 + ['bearish'] * 80 + ['intertwined'] * (n - 160),
+        'price_vs_sma': ['above'] * 100 + ['below'] * 60 + ['near'] * (n - 160),
+        'vix1d':         np.abs(12 + np.random.randn(n) * 2),   # always positive
+        'vix1d_20day_avg': 13.0,
+        'gex':           np.abs(np.random.randn(n)) + 0.1,       # always positive (gates pass)
     })
     
     results = backtester.backtest_period(
