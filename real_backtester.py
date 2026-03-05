@@ -291,38 +291,45 @@ class PointInTime:
 # ============================================================================
 
 def route(ind: Dict, vix: float, cfg: BacktestConfig) -> BotType:
+    """
+    OLD SIDEWAYS BOT LOGIC (pre-Ripster, reverted from EMA Clouds)
+    
+    Original decision matrix:
+    - If regime is BULLISH & all checks pass → BULLISH BOT
+    - If regime is BEARISH & all checks pass → BEARISH BOT  
+    - If regime is SIDEWAYS or directional checks fail → SIDEWAYS BOT (iron condor)
+    
+    This is simpler than Ripster and was more profitable for sideways trades.
+    """
     r, conf = ind["regime"], ind["confluence"]
     adx     = ind["adx"]
     pdi, mdi, rsi = ind["plus_di"], ind["minus_di"], ind["rsi"]
     di_gap  = abs(pdi - mdi)
 
-    if r == "SIDEWAYS":
-        # OLD STRATEGY: Sideways bot is unprofitable with Ripster
-        # Revert to NO_TRADE instead of trading sideways bots
-        # The original logic was: only trade sideways when ALL directional filters fail
-        # But that led to poor sideways bot performance (-$2,454 P&L)
-        # Better to let directional bots handle edge cases
-        return BotType.NO_TRADE
-
     if r == "BULLISH":
-        if conf < cfg.confluence_min:          return BotType.NO_TRADE
-        if adx < cfg.adx_directional_min:      return BotType.NO_TRADE
-        if pdi < mdi:                          return BotType.NO_TRADE
-        if rsi < cfg.rsi_bull_min:             return BotType.NO_TRADE
-        if di_gap < cfg.di_gap_min:            return BotType.NO_TRADE
-        if vix > cfg.vix_max_dir:              return BotType.NO_TRADE
+        # Strict directional filters for bullish
+        if conf < cfg.confluence_min:          return BotType.SIDEWAYS
+        if adx < cfg.adx_directional_min:      return BotType.SIDEWAYS
+        if pdi < mdi:                          return BotType.SIDEWAYS
+        if rsi < cfg.rsi_bull_min:             return BotType.SIDEWAYS
+        if di_gap < cfg.di_gap_min:            return BotType.SIDEWAYS
+        if vix > cfg.vix_max_dir:              return BotType.SIDEWAYS
         return BotType.BULLISH
 
     if r == "BEARISH":
-        if conf < cfg.confluence_min:          return BotType.NO_TRADE
-        if adx < cfg.adx_directional_min:      return BotType.NO_TRADE
-        if mdi < pdi:                          return BotType.NO_TRADE
-        if rsi > cfg.rsi_bear_max:             return BotType.NO_TRADE
-        if di_gap < cfg.di_gap_min:            return BotType.NO_TRADE
-        if vix > cfg.vix_max_dir:              return BotType.NO_TRADE
+        # Strict directional filters for bearish
+        if conf < cfg.confluence_min:          return BotType.SIDEWAYS
+        if adx < cfg.adx_directional_min:      return BotType.SIDEWAYS
+        if mdi < pdi:                          return BotType.SIDEWAYS
+        if rsi > cfg.rsi_bear_max:             return BotType.SIDEWAYS
+        if di_gap < cfg.di_gap_min:            return BotType.SIDEWAYS
+        if vix > cfg.vix_max_dir:              return BotType.SIDEWAYS
         return BotType.BEARISH
 
-    return BotType.NO_TRADE
+    # If regime is SIDEWAYS or directional filters fail → trade sideways
+    if adx > cfg.adx_sideways_max:            return BotType.NO_TRADE
+    if vix > cfg.vix_max_condor:              return BotType.NO_TRADE
+    return BotType.SIDEWAYS
 
 
 # ============================================================================
