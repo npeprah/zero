@@ -297,9 +297,12 @@ def route(ind: Dict, vix: float, cfg: BacktestConfig) -> BotType:
     di_gap  = abs(pdi - mdi)
 
     if r == "SIDEWAYS":
-        if adx > cfg.adx_sideways_max: return BotType.NO_TRADE
-        if vix > cfg.vix_max_condor:   return BotType.NO_TRADE
-        return BotType.SIDEWAYS
+        # OLD STRATEGY: Sideways bot is unprofitable with Ripster
+        # Revert to NO_TRADE instead of trading sideways bots
+        # The original logic was: only trade sideways when ALL directional filters fail
+        # But that led to poor sideways bot performance (-$2,454 P&L)
+        # Better to let directional bots handle edge cases
+        return BotType.NO_TRADE
 
     if r == "BULLISH":
         if conf < cfg.confluence_min:          return BotType.NO_TRADE
